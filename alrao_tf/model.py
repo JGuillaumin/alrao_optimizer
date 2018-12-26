@@ -131,8 +131,12 @@ class AlraoModel:
             else:
                 opt = AlraoGradientDescentOptimizer(min_lr=self.min_lr, max_lr=self.max_lr)
 
-            with tf.control_dependencies(list_train_op):
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+            with tf.control_dependencies(update_ops):
                 train_op_pre_classifier = opt.minimize(self.averaged_loss,
-                                                       var_list=tf.trainable_variables(scope=self.pre_classifier_scope.name))
+                                                       var_list=tf.trainable_variables(
+                                                           scope=self.pre_classifier_scope.name))
+                with tf.control_dependencies([train_op_pre_classifier, ]):
+                    main_op = tf.group(*list_train_op)
 
-        return train_op_pre_classifier
+        return main_op

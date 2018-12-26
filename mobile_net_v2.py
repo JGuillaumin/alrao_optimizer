@@ -46,9 +46,12 @@ class MobileNetv2:
                                           fused=True, name="bn1")
         x = tf.nn.relu(x)
 
-        # add grouped convolution ? groups=fan
         x = tf.layers.conv2d(inputs=x, filters=fan, kernel_size=3, strides=stride, padding="same", use_bias=False,
-                             data_format=self.data_format, name="conv2-3x3-grouped")
+                             data_format=self.data_format, name="conv2d-3x3-not-grouped")
+        # this is a naive implementation of grouped conv. To optimize later.
+        # x = grouped_convolution(inputs=x, groups=fan, kernel_size=3, strides=stride, padding="same", use_bias=False,
+        #                         data_format=self.data_format, name="conv2d-3x3-grouped")
+
         x = tf.layers.batch_normalization(inputs=x, axis=self.axis_bn, training=self.is_training_bn,
                                           fused=True, name="bn2")
         x = tf.nn.relu(x)
@@ -77,7 +80,7 @@ class MobileNetv2:
             x = tf.layers.batch_normalization(inputs=x, axis=self.axis_bn, training=self.is_training_bn,
                                               fused=True, name="bn1")
             x = tf.nn.relu(x, name='relu1')
-
+            print("InputBlocks : {}".format(x))
         fan_in = int(self.gamma*32)
 
         for i in range(len(self.expansion)):
@@ -93,13 +96,14 @@ class MobileNetv2:
                                        fan_out=self.fan_out[i],
                                        stride=stride)
                 fan_in = self.fan_out[i]
+                print("BlockMobileNet-{} : {}".format(i, x))
 
         with tf.variable_scope('OutputBlock'):
             x = tf.layers.conv2d(inputs=x, filters=int(self.gamma * 1280), kernel_size=1, strides=1,
                                  padding='same', use_bias=False, data_format=self.data_format, name="conv2")
             x = tf.layers.batch_normalization(inputs=x, axis=self.axis_bn, training=self.is_training_bn,
                                               fused=True, name="bn2")
-            x = tf.nn.relu(x, name='relu1')
+            x = tf.nn.relu(x, name='relu')
             # print("feature maps before AVG-POOL : {}".format(x))
             x = tf.layers.average_pooling2d(inputs=x, pool_size=4, strides=1, data_format=self.data_format)
             # print("feature maps after ABG-POOL : {}".format(x))
@@ -113,3 +117,25 @@ class MobileNetv2:
             logits = tf.layers.dense(inputs=final_features, units=self.num_classes)
 
         return logits
+
+
+def grouped_convolution(inputs, groups,
+                        kernel_size=3, strides=1, padding="same",
+                        use_bias=False, data_format="channels_last",
+                        name="grouped_conv2d"):
+    axis = -1 if data_format=="channels_last" else 1
+    fan_in = inputs.get_shape().as_list()[axis]
+    assert fan_in % groups == 0
+
+    filters = fan_in//groups
+    list_inputs = tf.split(inputs, groups, axis=axis)
+    list_outputs = []
+    with tf.variable_scope(name):
+        for i, partial_inputs in enumerate(list_inputs):
+            partial_outputs = tf.layers.conv2d(partial_inputs, filters=filters, kernel_size=kernel_size,
+                                               strides=strides, padding=padding, data_format=data_format,
+                                               use_bias=use_bias, name="conv-{}".format(i))
+            list_outputs.append(partial_outputs)
+
+        outputs = tf.concat(list_outputs, axis=axis)
+    return outputs

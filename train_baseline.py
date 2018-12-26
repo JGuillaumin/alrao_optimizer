@@ -3,6 +3,7 @@ import os
 from argparse import ArgumentParser
 import numpy as np
 import sys
+from time import time
 
 from mobile_net_v2 import MobileNetv2
 from utils import get_generators, COLORS, get_best_model_ckpt
@@ -47,7 +48,7 @@ def main(args):
     with tf.variable_scope("MobileNetv2"):
         model = MobileNetv2(num_classes=10,
                             gamma=1.,
-                            data_format="channels_last",
+                            data_format=data_format,
                             is_training_bn=is_training_bn,
                             expansion=[1, 6, 6, 6, 6, 6, 6],
                             fan_out=[16, 24, 32, 64, 96, 160, 320],
@@ -112,8 +113,9 @@ def main(args):
     # initialize model
     sess.run(tf.global_variables_initializer())
 
+    print("... start training ...")
     for epoch in range(1, args.epochs+1):
-
+        start_epoch = time()
         # ======================= TRAIN ==================================
         # re-initialize local variables in streaming metrics
         sess.run(tf.local_variables_initializer())
@@ -145,6 +147,7 @@ def main(args):
         valid_writer.add_summary(global_step=epoch, summary=summaries)
         valid_writer.flush()
         list_acc_val.append(acc_v)
+        end_epoch = time()
         # ==================================================================
 
         if acc_v > best_acc:
@@ -153,8 +156,9 @@ def main(args):
             best_saver.save(sess, best_model_ckpt_path, global_step=epoch)
         else:
             color = COLORS['red']
-        print("EPOCH {} | TRAIN acc={:.4f} | {}VALID acc={:.5f}{}".format(epoch, list_acc_train[-1],
-                                                                          color[0], list_acc_val[-1], color[1]))
+        print("EPOCH {} (in {:.2f} s)| TRAIN acc={:.4f} | {}VALID acc={:.5f}{}".format(epoch, end_epoch - start_epoch,
+                                                                                       list_acc_train[-1],  color[0],
+                                                                                       list_acc_val[-1], color[1]))
 
     # ======================= TEST ==================================
     # load weights from best model and make inference on test set
