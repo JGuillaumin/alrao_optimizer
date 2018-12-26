@@ -1,0 +1,211 @@
+import tensorflow as tf
+import os
+from argparse import ArgumentParser
+import numpy as np
+import sys
+
+from mobile_net_v2 import MobileNetv2
+from utils import get_generators, COLORS, get_best_model_ckpt
+from alrao_tf import AlraoModel
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+
+def main(args):
+
+    print("TF version : ", tf.__version__)
+    with_cuda = tf.test.is_built_with_cuda()
+    with_gpu = tf.test.is_gpu_available()
+    if with_cuda and with_gpu:
+        data_format = "channels_first"
+    else:
+        data_format = "channels_last"
+    print("Built with CUDA : ", with_cuda)
+    print("Available GPU : ", with_gpu)
+    print("data_format : ", data_format)
+
+    if tf.gfile.Exists(args.output_dir):
+        tf.gfile.DeleteRecursively(args.output_dir)
+    tf.gfile.MakeDirs(args.output_dir)
+
+    # create TensorFlow session
+    config = tf.ConfigProto(allow_soft_placement=True)
+    if with_cuda and with_gpu:
+        config.gpu_options.allow_growth = True
+    sess = tf.Session(config=config)
+
+    iterator_train, iterator_valid, iterator_test, \
+        steps_per_epoch_train, steps_per_epoch_val, steps_per_epoch_test = get_generators(batch_size=args.batch_size,
+                                                                                          data_format=data_format,
+                                                                                          verbose=args.verbose)
+    shape = [None, 32, 32, 3] if data_format == "channels_last" else [None, 3, 32, 32]
+    with tf.name_scope("Inputs"):
+        batch_x = tf.placeholder(shape=shape, dtype=tf.float32, name="batch_x")
+        batch_y = tf.placeholder(shape=[None, ], dtype=tf.int32, name="batch_x")
+        is_training_bn = tf.placeholder(shape=[], dtype=tf.bool)
+
+    with tf.variable_scope("MobileNetv2") as pre_classifier_scope:
+        model = MobileNetv2(num_classes=10,
+                            gamma=1.,
+                            data_format="channels_last",
+                            is_training_bn=is_training_bn,
+                            expansion=[1, 6, 6, 6, 6, 6, 6],
+                            fan_out=[16, 24, 32, 64, 96, 160, 320],
+                            num_blocks=[1, 2, 3, 4, 3, 3, 1],
+                            stride=[1, 1, 2, 2, 1, 2, 1])
+        # get final features of MobileNet V2
+        features = model.partial_inference(inputs=batch_x)
+        print("features : {}".format(features))
+
+    with tf.variable_scope("AlraoClassifiers") as alrao_scope:
+        # Add final custom layer of ALRAO model
+        alrao_model = AlraoModel(pre_classifier_scope=pre_classifier_scope,
+                                 nb_classifiers=args.nb_classifiers,
+                                 num_classes=10,
+                                 weight_decay=args.weight_decay,
+                                 min_lr=args.min_lr,
+                                 max_lr=args.max_lr,
+                                 momentum=args.momentum,
+                                 verbose=True)
+
+        alrao_model.apply(features=features)
+
+    with tf.name_scope("Loss"):
+        # compute loss for each sub-classifier and loss for averaged classifiers
+        # create metric objects for loss + accuracy in each classifier + averaged classifier
+        alrao_model.compute_losses(labels=batch_y)
+
+    with tf.name_scope("Optimizer"):
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+            train_op = alrao_model.get_train_op()
+
+    with tf.name_scope("Summaries"):
+        # all metrics are already computed !
+        update_metric_ops = list()
+        update_metric_ops.append(alrao_model.update_averaged_cxent_op)
+        update_metric_ops.append(alrao_model.update_averaged_acc_op)
+        if alrao_model.update_l2_pre_cls_op is not None:
+            update_metric_ops.append(alrao_model.update_l2_pre_cls_op)
+
+        update_metric_ops.extend(alrao_model.list_update_cxent_op)
+        update_metric_ops.extend(alrao_model.list_update_acc_op)
+        if len(alrao_model.list_update_l2_op) > 0:
+            update_metric_ops.extend(alrao_model.list_update_l2_op)
+
+        local_update_ops = tf.group(*update_metric_ops, name="local_update_ops")
+
+    for i in range(alrao_model.nb_classifiers):
+        tf.summary.scalar('ACCURACY/cls-{}'.format(i), alrao_model.list_metric_acc[i])
+        tf.summary.scalar('CXENT/cls-{}'.format(i), alrao_model.list_metric_cxent[i])
+
+    tf.summary.scalar('AveragedModel/accuracy', alrao_model.metric_averaged_acc)
+    tf.summary.scalar('AveragedModel/cxent', alrao_model.metric_averaged_cxent)
+    merged_summaries_valid = tf.summary.merge_all()
+
+    if len(alrao_model.list_update_l2_op) > 0:
+        for i in range(alrao_model.nb_classifiers):
+            tf.summary.scalar('L2-LOSS/cls-{}'.format(i), alrao_model.list_metric_l2[i])
+        tf.summary.scalar("AveragedModel/l2-loss", alrao_model.metric_l2_pre_cls)
+    merged_summaries_train = tf.summary.merge_all()
+
+    best_saver = tf.train.Saver(var_list=tf.global_variables(), max_to_keep=1)
+    best_model_ckpt_path = os.path.join(args.output_dir, 'best_model_ckpt')
+
+    train_writer = tf.summary.FileWriter(args.output_dir + '/train', sess.graph)
+    valid_writer = tf.summary.FileWriter(args.output_dir + '/valid')
+    test_writer = tf.summary.FileWriter(args.output_dir + '/test')
+
+    # initialize variables
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.local_variables_initializer())
+
+    best_acc = 0.
+    list_acc_val = []
+    list_acc_train = []
+
+    for epoch in range(1, args.epochs+1):
+
+        # ======================= TRAIN ==================================
+        # re-initialize local variables in streaming metrics
+        sess.run(tf.local_variables_initializer())
+        feed_dict = {is_training_bn: True}
+        for _ in range(steps_per_epoch_train):
+            x, y = iterator_train.next()
+            feed_dict[batch_x] = x
+            feed_dict[batch_y] = y
+            _ = sess.run([train_op, local_update_ops], feed_dict=feed_dict)
+
+        acc_v, summaries = sess.run([alrao_model.metric_averaged_acc, merged_summaries_train], feed_dict=feed_dict)
+        train_writer.add_summary(global_step=epoch, summary=summaries)
+        train_writer.flush()
+        list_acc_train.append(acc_v)
+        # ==================================================================
+
+        # ======================= VALIDATION ==================================
+        # re-initialize local variables in streaming metrics
+        sess.run(tf.local_variables_initializer())
+        feed_dict = {is_training_bn: False}
+        for _ in range(steps_per_epoch_val):
+            x, y = iterator_valid.next()
+            feed_dict[batch_x] = x
+            feed_dict[batch_y] = y
+            _ = sess.run([local_update_ops], feed_dict=feed_dict)
+
+        feed_dict = {is_training_bn: False}
+        acc_v, summaries = sess.run([alrao_model.metric_averaged_acc, merged_summaries_valid], feed_dict=feed_dict)
+        valid_writer.add_summary(global_step=epoch, summary=summaries)
+        valid_writer.flush()
+        list_acc_val.append(acc_v)
+        # ==================================================================
+
+        if acc_v > best_acc:
+            best_acc = acc_v
+            color = COLORS['green']
+            best_saver.save(sess, best_model_ckpt_path, global_step=epoch)
+        else:
+            color = COLORS['red']
+        print("EPOCH {} | TRAIN acc_averaged_model={:.4f} | {}VALID acc_averaged_model={:.5f}{}".format(
+            epoch, list_acc_train[-1], color[0], list_acc_val[-1], color[1]))
+
+    # ======================= TEST ==================================
+    # load weights from best model and make inference on test set
+    best_ckpt = get_best_model_ckpt(best_model_ckpt_path)
+    best_epoch = np.argmax(list_acc_val)
+    if best_ckpt is not None:
+        print("Load best model {}, snapshot at epoch={}".format(best_ckpt, best_epoch))
+        best_saver.restore(sess, best_ckpt)
+    # re-initialize local variables in streaming metrics
+    sess.run(tf.local_variables_initializer())
+    feed_dict = {is_training_bn: False}
+    for _ in range(steps_per_epoch_test):
+        x, y = iterator_test.next()
+        feed_dict[batch_x] = x
+        feed_dict[batch_y] = y
+        _ = sess.run([local_update_ops], feed_dict=feed_dict)
+
+    feed_dict = {is_training_bn: False}
+    acc_test, summaries = sess.run([alrao_model.metric_averaged_acc, merged_summaries_valid], feed_dict=feed_dict)
+    test_writer.add_summary(global_step=best_epoch, summary=summaries)
+    test_writer.flush()
+    print("EPOCH {} | TEST acc_averaged_model={:.4f}".format(best_epoch, acc_test))
+    # ==================================================================
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--batch_size", dest="batch_size", type=int, default=32)
+    parser.add_argument("--epochs", dest="epochs", type=int, default=50)
+
+    parser.add_argument("--nb_classifiers", dest="nb_classifiers", type=int, default=10)
+    parser.add_argument("--max_lr", dest="max_lr", type=float, default=10.)
+    parser.add_argument("--min_lr", dest="min_lr", type=float, default=1e-5)
+
+    parser.add_argument("--momentum", dest="momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", dest="weight_decay", type=float, default=0.0001)
+
+    parser.add_argument("--output_dir", dest="output_dir", type=str, default="logs/alrao_deterministic/")
+    parser.add_argument("--verbose", dest="verbose", type=bool, default=True)
+
+    args = parser.parse_args(sys.argv[1:])
+    main(args)
